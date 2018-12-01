@@ -1,0 +1,154 @@
+---
+title: "Pitch Classification -- Mariners"
+author: "Nolan McCafferty"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(e1071)
+library(caret)
+```
+
+Before we create our pitch classification model, we will do some initial data exploration. Analyzing the type varibale of the pitches in the training set we see that the different pitches are fastball, cutter, sinker, slider, changeup, curveball, and split finger (FS). 
+
+After cleaning the type variable (removing pitch types that were numbers) and plotting picth speed vs spin rate, we get the plot below:
+
+
+```{r echo=FALSE, fig.height=4}
+train <- read.csv("train.csv")
+
+train <- train %>%
+  filter(type %in% c("CH",  "CU", "FA", "FC", "FS", "SI", "SL")) %>%
+  mutate_at(vars("type"), funs(factor))
+
+ggplot(train, aes(x=pitch_speed, y=spin_rate, colour=type)) + geom_point() 
+
+train <- train %>%
+  filter(spin_rate != 3000)
+```
+
+
+
+There are a couple very interesting things about this plot. First, there are quite a few pitches with spin rate exactly 3000, suggesting a "ceiling" that perhaps the machine measuring the pitches could not exceed. To improve our model, I am going to remove those pitches. Also, even more obvious is the fact that there are tons of pitches with spin rate under 500. This is almost unheard of, most pitches are thrown with spin rate between 1000-3000 rpm. This leads me to beleive that either the spin_rate is measured in different units than rpm or there has been some kind of scaling for the pitches. However, the distribution of pitch types is consistent for the velocity vs. spin rate data that I have seen, fastballs on the upper-right, sliders and changeups spread throughout the middle, and curveballs on the bottom left. Thus, I do not believe our model predictions will be affected by this scaling change. 
+
+\newpage
+Another interesting plot is one of horizontal break vs. vertical break:
+
+```{r echo=FALSE, fig.height=4}
+ggplot(train, aes(x=break_x, y=break_z, colour=type)) + geom_point() 
+```
+
+
+As you can see in the plot above, there are clear patterns for right and left handed pitchers. Clearly, fastballs have the least downward break, followed by changeups, sliders, and curveballs. The offspeed pitches are split into two groups in terms of horizontal break based on the handedness of the pitcher--sliders and curvebvalls have positive horizontal break for right-handed pitchers and negative horizontal break for lefties. Now to begin building our model, we will use a random forest approach. To start, we will consider all variables that seem like they could possibly be relavent in pitch classification:
+
+```{r echo=FALSE, fig.height=4}
+set.seed(3)
+training <- train %>%
+  select(-c("pitch_id", "batter_side", "inning", "half", "strikes", "balls", "outs")) %>%
+  mutate_at(vars(starts_with("pf")), funs(as.numeric))
+
+training <- training[sample(nrow(training)),]
+validate <- training[(nrow(training)*.75):nrow(training),]
+training <- training[1:(nrow(training)*.75),]
+```
+
+```{r echo=FALSE, fig.height=3}
+pitch.rf <- randomForest(factor(type) ~ ., data=training, mtry=3, important=T)
+plot(pitch.rf)
+```
+
+The plot above clearly shows that the error rate for our primitive model plateaus at around 100 trees, so this is the value we will use to cross validate. Next, we can look at the variable importances that our model gives us:
+
+
+```{r fig.height=9, echo=FALSE}
+varImpPlot(pitch.rf, sort=T, main="Variable Importance")
+```
+
+\newpage
+
+We can see from the Variable Importance plot that vertical break is the most important variable in our model. Pitch velocity is also a very important variable. This makes intuative sense because when I think of what really seperates a fastball from a changeup from a slider, I think of how fast the pitch is moving and how the pitch breaks. Also, vertical break should be more important than horizontal break because if you think about it, pitches like cutters and sliders have very similiar horizontal break, as well as pitches like sinkers, changeups, and splitters. On the other end of the spectrum, we see that variables like plate x, plate z, and pitcher side seem to be relatively unimportant. This makes sense because any pitch can end up anywhere on the plate (or off) and pitcher handedness is already taken care of in the variable Pitcher. We will remove these unimportant variables for the next iteration of our model. To get a baseline, we will use our preliminary model to predict the validation data. 
+
+```{r include=FALSE}
+# Predicting response variable
+predictions <- predict(pitch.rf, validate)
+
+pitch.matrix <- confusionMatrix(data=predictions, 
+                reference=validate$type, positive='yes')
+```
+
+```{r}
+pitch.matrix$overall[1]
+```
+
+The accuracy of the predicted data is 93.8%. Now we will make the improvements on our model. 
+
+```{r echo=FALSE}
+training <- training %>%
+  select(-c("plate_x", "plate_z", "y55", "pitcher_side", "release_angle_z", "vz55", "extension", "release_angle_x", "vx55", "z55", "release_z"))
+
+validate <- validate %>%
+  select(-c("plate_x", "plate_z", "y55", "pitcher_side", "release_angle_z", "vz55", "extension", "release_angle_x", "vx55", "z55", "release_z"))
+
+pitch.rf2 <- randomForest(factor(type) ~ ., data=training, mtry=3, important=T, ntree=100)
+
+predictions <- predict(pitch.rf2, validate)
+
+pitch.matrix2 <- confusionMatrix(data=predictions, 
+                reference=validate$type, positive='yes')
+pitch.matrix2$overall[1]
+```
+
+By removing the bottom 11 variables in terms of importance we were able to increase the accuracy of our model by 0.6%. Now we will cross-validate to find the optimal value of mtry (the number of variables sampled at each split). 
+
+```{r echo=FALSE, include=FALSE}
+bestmtry <- tuneRF(training[,-20], training[,20], stepFactor=1.5, improve=.001, ntree=100)
+```
+
+```{r echo=FALSE}
+plot(bestmtry, type="o")
+```
+
+As we can see from the plot above, the optimal value of the mtry parameter is 9. Thus, our final model will use mtry=9 and the most important variables:
+
+\newpage
+
+```{r}
+pitch.rf.final <- randomForest(factor(type) ~ ., data=training, mtry=9, ntree=100)
+
+predictions <- predict(pitch.rf.final, validate)
+
+pitch.matrix.final <- confusionMatrix(data=predictions, 
+                reference=validate$type, positive='yes')
+pitch.matrix.final$table
+pitch.matrix.final$overall[1]
+```
+
+The accuracy of our final model is about 95%. From the confusion matrix above, we can see that the most commonly misclassified pitches by the model are the fastball and the sinker. This makes sense because fastballs and sinkers can be very similar pitches depending on who is throwing them. 
+
+Now we predict the test data. The predictions for the test data can be found in the csv file pitch_predictions.csv
+
+```{r, echo=FALSE}
+test <- read.csv("test.csv")
+train <- rbind(training, validate) %>%
+  filter(pitcher %in% levels(test$pitcher)) %>%
+  mutate_at(vars("pitcher"), funs(factor))
+  
+
+pitch.rf <- randomForest(factor(type) ~ ., data=train, mtry=9, ntree=100)
+
+test <- test %>%
+  select(-c("pitch_id", "batter_side", "inning", "half", "strikes", "balls", "outs","plate_x", "plate_z", "y55", "pitcher_side", "release_angle_z", "vz55", "extension", "release_angle_x", "vx55", "z55", "release_z")) %>%
+  mutate_at(vars(starts_with("pf")), funs(as.numeric))
+
+test$predicted.response <- predict(pitch.rf, test)
+
+write.csv(test, "test_predictions.csv")
+```
+
+
+
+
