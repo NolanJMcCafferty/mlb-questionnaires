@@ -1,0 +1,128 @@
+---
+title: "Predicting Strikeout Percentages"
+author: "Nolan McCafferty"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(xgboost)
+library(Metrics)
+```
+
+The goal of this analysis is to predict the strikeout percentage in the second half of the 2017 season for each player given his pitching statistics in the first half of 2017. The statistics for each pitcher include innings pitched, ERA, FIP, first half strikeout percentage, first half swing percentage, and many more. My initial step was to do some exploratory analysis of the variables. The plot below shows the relationship between first half strikeout percentage and second half strikeout percentage. This relationship is a positive one which makes sense because pitchers with a higher strikeout percentage in the first half should typically also have a high percentage in the second half of the year. Also, wow Craig Kimbrel had a \textbf{ridiculous} second half. 
+
+```{r, echo=FALSE, fig.height=3, fig.width=5.5}
+strikeouts <- read.csv("strikeouts.csv")
+
+ggplot(strikeouts, aes(K., X2ndHalfK.)) + geom_point() + xlab("1st Half K%") + ylab("2nd Half K%") +
+  geom_text(aes(label=ifelse(X2ndHalfK. > .47,as.character(Name),'')), nudge_y = +0.01, hjust=1,vjust=0,size=3)
+```
+
+Looking at this plot I noticed significant differences between the first and second half K% for a couple pitchers. Wanting to explore this more, I then plotted the differences between the two:
+
+```{r, echo=FALSE, fig.height=3.5, fig.width=5.5}
+
+ggplot(strikeouts, aes(seq_along(Name), X2ndHalfK. - K.)) + geom_point() + ylab("Difference in K%") + xlab("Index") +
+  geom_text(aes(label=ifelse(X2ndHalfK. - K. > .13 | X2ndHalfK. - K. < -.2,as.character(Name),'')), nudge_y = +0.01, hjust=1,vjust=0,size=3)
+
+```
+
+From the plot above we can see that Junior Guerra, Ryan Madson, and Matt Belisle were the three pitchers that improved their strikeout rate the most from the first to the second half of the 2017 season. Additionally, Jame Hoyt was by far the worst case of a strikeout rate decreasing in the second half. Looking at the data for these four pitchers, the only major difference I can see between the Hoyt and the other three is his much lower contact rate in the first half.
+
+```{r, echo=FALSE}
+
+outliers <- strikeouts %>%
+  filter(Name %in% c("Junior Guerra", "Ryan Madson", "Matt Belisle", "James Hoyt")) %>%
+  select(-c("Team", "fangraphs_id", "G", "IP", "X2ndHalfIP"))
+knitr::kable(outliers)
+
+```
+
+Now to make the predictions we will compose several models. We will subset the data into training and testing datasets and use root-mean-squared-error to evaluate each model. First, linear regression:
+
+```{r, echo=FALSE}
+set.seed(47)
+strikemat <- data.matrix(strikeouts)
+n <- nrow(strikemat)*.75
+
+train <- strikemat[1:n,]
+test <- strikemat[n:nrow(strikemat),]
+
+train.x <- train[,c("G", "IP", "ERA", "FIP", "xFIP", "AVG", "K.", "BB.", "Swing.", "Contact.", "GB.", "LD.", "FB.")]
+train.y <- train[,c("X2ndHalfK.")]
+
+test.x <- test[,c("G", "IP", "ERA", "FIP", "xFIP", "AVG", "K.", "BB.", "Swing.", "Contact.", "GB.", "LD.", "FB.")]
+test.y <- test[,c("X2ndHalfK.")]
+
+data <- data.frame(cbind(train.x, train.y))
+
+fit.lm <- lm(train.y ~ ., data)
+lm.fitted <- predict(fit.lm, data.frame(test.x))
+rmse(test.y, lm.fitted)
+```
+
+
+Then Ridge Regression and LASSO:
+
+```{r}
+lambda.grid <- 10^seq(5,-5, length = 100)
+fit.ridge.cv <- cv.glmnet(train.x, train.y, lambda = lambda.grid, alpha = 0)
+ridge.fitted <- predict(fit.ridge.cv, newx = test.x, s = "lambda.min")
+rmse(test.y, ridge.fitted)
+```
+
+
+```{r}
+fit.lasso.cv <- cv.glmnet(train.x, train.y, lambda = lambda.grid, alpha = 1)
+lasso.fitted <- predict(fit.lasso.cv, newx = test.x, s = "lambda.min")
+rmse(test.y, lasso.fitted)
+```
+
+
+Finally, we will use the powerful XGBoost algorithm:
+
+```{r}
+RMSE <- c()
+for (i in 1:200) {
+  modelxg <- xgboost(data = train.x, 
+   label = as.matrix(train.y),
+   objective = "reg:linear", 
+   eval_metric = "rmse",
+   max_depth = 2, 
+   nrounds = i,
+   verbose = FALSE
+   )
+
+xg.fit <- predict(modelxg, test.x)
+RMSE[i] <- rmse(test.y, xg.fit)
+}
+
+best <- which.min(RMSE)
+
+bst <- xgboost(data = train.x, 
+   label = as.matrix(train.y),
+   objective = "reg:linear", 
+   eval_metric = "rmse",
+   max_depth = 2, 
+   nrounds = best,
+   verbose = FALSE
+   )
+
+xg.fit <- predict(bst, test.x)
+rmse(test.y, xg.fit)
+
+knitr::kable(xgb.importance(model=bst))
+```
+
+We can see that the XGBoost model actually performed worse than the previous models in terms of RMSE. From the feature importance table we can see that strikeout percentage was by far most important followed by contact percentage. This again makes sense because the strikeout percentages in the first and second half should typically be very similar. Of the models above, the Ridge Regression and LASSO models gave us the lowest RMSE. Using the RR model, the first few predictions can be seen below:
+
+```{r, echo=FALSE}
+knitr::kable(data.frame(Name=strikeouts[n:(n+9),]$Name, Actual=test.y[1:10], Predicted=format(round(ridge.fitted[1:10], 3))))
+```
+
+
+
